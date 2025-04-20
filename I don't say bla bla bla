@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import tempfile
+import webbrowser
+import threading
+import time
+import logging
+import signal
+import sqlite3
+import subprocess
+from datetime import datetime
+from contextlib import contextmanager
+from urllib.parse import urlparse
+import re
+
+import click
+import requests
+from bs4 import BeautifulSoup
+from psycopg2.pool import ThreadedConnectionPool
+from prometheus_client import start_http_server, Counter, Histogram, Gauge
+import PySimpleGUI as sg
+
+# =============================================================================
+#                                  LOGGING
+# =============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("scraper.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# =============================================================================
+#                          PROMETHEUS METRICS
+# =============================================================================
+REQUESTS_TOTAL   = Counter('http_requests_total', 'Total requests made', ['domain','status'])
+FINDINGS_TOTAL   = Counter('secrets_found_total','Secrets found by type', ['type'])
+CIRCUIT_STATE    = Gauge('circuit_state','Circuit breaker state (0=closed,1=open)',['domain'])
+REQUEST_DURATION = Histogram('request_duration_seconds','Request duration',['domain'])
+QUEUE_SIZE       = Gauge('url_queue_size','Current URL queue size')
+
+# =============================================================================
+#                            SCRAPER CLASSES
+# =============================================================================
+class CircuitBreaker:
+    def __init__(self, threshold=5, reset_timeout=60):
+        self.threshold = threshold
+        self.reset_timeout = reset_timeout
+        self.failures = 0
+        self.last_failure = 0
+        self._lock = threading.Lock()
+
+    def should_block(self):
+        with self._lock:
+            if self.failures < self.threshold:
+                return False
+            if (time.time() - self.last_failure) > self.reset_timeout:
+                self.failures = 0
+                return False
+            return True
+
+    def record_failure(self):
+        with self._lock:
+            if (time.time() - self.last_failure) > self.reset_timeout:
+                self.failures = 0
+            self.failures += 1
+            self.last_failure = time.time()
+
+class BugBountyScraper:
+    def __init__(self, db_config: dict, allowed_domains=None, use_proxies=False, proxy_list=None):
+        start_http_server(8000)
+        self.db_config = db_config
+        self._init_db()
+        self.allowed_domains = {d.lower() for d in allowed_domains} if allowed_domains else None
+        self.tos_allow = {}
+        self.tos_patterns = [re.compile(p, re.I) for p in (
+            r'\bno\s+robots?\b', r'\bno\s+scraping\b',
+            r'\bno\s+automated\s+access\b', r'\b禁止爬虫\b'
+        )]
+        self.visited_db = sqlite3.connect(':memory:', check_same_thread=False)
+        self.visited_db.execute("CREATE TABLE urls(url TEXT PRIMARY KEY)")
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 BugBountyScanner/4.0',
+            'Accept': 'text/html,application/xml;q=0.9,*/*;q=0.8',
+            'DNT': '1'
+        })
+        self.use_proxies   = use_proxies
+        self.proxy_list    = proxy_list or []
+        self.circuit_breakers = {}
+        self.url_queue     = []
+        self.findings_buffer = []
+        self.stats = {
+            'start_time': datetime.now(),
+            'pages_scraped': 0,
+            'max_pages': 5000
+        }
+        signal.signal(signal.SIGINT, self._shutdown_handler)
+
+    def _init_db(self):
+        self.pool = ThreadedConnectionPool(1,10, **self.db_config)
+        with self.db_cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS targets (
+              id SERIAL PRIMARY KEY, url TEXT UNIQUE, domain TEXT, status TEXT DEFAULT 'pending',
+              discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, scanned_at TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS findings (
+              id SERIAL PRIMARY KEY, target_id INTEGER REFERENCES targets(id),
+              type TEXT, match TEXT, context TEXT, source_url TEXT, severity TEXT,
+              discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS scan_metadata (
+              scan_id SERIAL PRIMARY KEY, start_time TIMESTAMP, end_time TIMESTAMP,
+              pages_scraped INTEGER, findings_count INTEGER
+            );
+            """)
+
+    @contextmanager
+    def db_cursor(self):
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                yield cur
+            conn.commit()
+        except:
+            conn.rollback()
+            raise
+        finally:
+            self.pool.putconn(conn)
+
+    def _shutdown_handler(self, signum, frame):
+        logging.info("Shutting down…")
+        self._flush_buffers()
+        self.pool.closeall()
+        self.visited_db.close()
+        sys.exit(0)
+
+    # … (all your existing methods: is_allowed_domain, should_visit, load_terms_of_service,
+    #     run, make_request, process_response, etc., unchanged) …
+
+    def run(self, target_url=None, pages=3):
+        # … your existing scrape loop …
+        pass
+
+# =============================================================================
+#                          BUG FINDER CONFIGURATION
+# =============================================================================
+TOOLS = {
+    "pylint": {
+        "cmd": ["pylint", "--output-format=json"],
+        "parser": lambda out: json.loads(out) if out else []
+    },
+    "flake8": {
+        "cmd": ["flake8", "--format=%(path)s:%(row)d:%(col)d: %(code)s %(text)s"],
+        "parser": lambda out: [l for l in out.splitlines() if l]
+    },
+    "bandit": {
+        "cmd": ["bandit", "-r", ".", "-f", "json"],
+        "parser": lambda out: json.loads(out).get("results", [])
+    },
+    "mypy": {
+        "cmd": ["mypy", "--show-error-codes"],
+        "parser": lambda out: [l for l in out.splitlines() if l]
+    },
+}
+
+FORMATTERS = {
+    "black": {
+        "check_cmd": ["black", "--check", "--diff"],
+        "fix_cmd"  : ["black"]
+    },
+    "autopep8": {
+        "check_cmd": ["autopep8", "--diff"],
+        "fix_cmd"  : ["autopep8", "--in-place"]
+    }
+}
+
+def run_tool(name, path):
+    cfg = TOOLS[name]
+    try:
+        proc = subprocess.run(cfg["cmd"] + [path],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True)
+        out = proc.stdout or proc.stderr
+        return name, cfg["parser"](out)
+    except FileNotFoundError:
+        return name, f"[!] {name} not installed."
+
+def run_formatter_check(name, path):
+    cfg = FORMATTERS[name]
+    try:
+        proc = subprocess.run(cfg["check_cmd"] + [path],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True)
+        return name, proc.stdout or proc.stderr
+    except FileNotFoundError:
+        return name, f"[!] {name} not installed."
+
+def apply_auto_fix(name, path):
+    try:
+        subprocess.run(FORMATTERS[name]["fix_cmd"] + [path], check=True)
+    except Exception as e:
+        print(f"[!] {name} fix failed: {e}")
+
+def generate_html_report(results, fmt_checks, outfile):
+    html = ["<html><meta charset='utf-8'><body>"]
+    html.append(f"<h1>Report for {results['path']}</h1>")
+    for tool, data in results["tools"].items():
+        html.append(f"<h2>{tool}</h2><pre>{json.dumps(data, indent=2)}</pre>")
+    html.append("<h2>Format Checks</h2>")
+    for f, diff in fmt_checks.items():
+        html.append(f"<h3>{f}</h3><pre>{diff}</pre>")
+    html.append("</body></html>")
+
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write("\n".join(html))
+    webbrowser.open(f"file://{outfile}")
+
+# =============================================================================
+#                                   CLI
+# =============================================================================
+@click.group()
+def cli():
+    pass
+
+@cli.command(help="Run the Bug Bounty Scraper")
+@click.option("--target-url",   default=None, help="Start URL to scrape")
+@click.option("--bugcrowd-pages", default=3, type=int, help="Pages of Bugcrowd to seed")
+def scrape(target_url, bugcrowd_pages):
+    DB_CONFIG = {
+        'dbname':   'bugbounty',
+        'user':     'scraper',
+        'password': 'securepassword',
+        'host':     'localhost',
+        'port':     '5432'
+    }
+    scraper = BugBountyScraper(
+        db_config     = DB_CONFIG,
+        allowed_domains = {'bugcrowd.com','api.bugcrowd.com'},
+        use_proxies   = False
+    )
+    scraper.run(target_url=target_url, pages=bugcrowd_pages)
+
+@cli.command(help="Analyze a Python file for bugs & style")
+@click.argument("path", type=click.Path(exists=True))
+@click.option("--fix",          is_flag=True, help="Apply auto‑fixes")
+@click.option("--formatter",    type=click.Choice(["black","autopep8"]), default="black")
+@click.option("--html-report",  is_flag=True, help="Generate HTML report")
+@click.option("--gui",          is_flag=True, help="Launch GUI")
+def analyze(path, fix, formatter, html_report, gui):
+    # Parallel run tools
+    results = {"path":path, "tools": {}}
+    for name in TOOLS:
+        name, out = run_tool(name, path)
+        results["tools"][name] = out
+
+    # Format checks
+    fmt_checks = {}
+    for f in FORMATTERS:
+        _, diff = run_formatter_check(f, path)
+        fmt_checks[f] = diff
+
+    # GUI
+    if gui:
+        layout = [
+            [sg.Text(f"Analyzing: {path}")],
+            [sg.Multiline(default_text="Starting…\n", size=(80,20), key="OUT")],
+            [sg.Button("Fix"), sg.Button("HTML"), sg.Button("Exit")]
+        ]
+        win = sg.Window("Bug Finder", layout)
+        while True:
+            ev, vals = win.read()
+            if ev in (sg.WIN_CLOSED, "Exit"):
+                break
+            if ev == "Fix":
+                apply_auto_fix(formatter, path)
+                win["OUT"].print(f"Applied {formatter}")
+            if ev == "HTML":
+                out = os.path.join(tempfile.gettempdir(),"report.html")
+                generate_html_report(results, fmt_checks, out)
+        win.close()
+        return
+
+    # CLI output
+    click.echo(f"\n=== Analysis of {path} ===")
+    for t, data in results["tools"].items():
+        click.echo(f"\n--- {t.upper()} ---")
+        click.echo(json.dumps(data, indent=2) if not isinstance(data,str) else data)
+
+    click.echo("\n=== Format Suggestions ===")
+    for f, diff in fmt_checks.items():
+        click.echo(f"\n*** {f} ***\n{diff or '(no issues)'}")
+
+    if fix:
+        click.echo(f"\nApplying {formatter} fixes…")
+        apply_auto_fix(formatter, path)
+
+    if html_report:
+        out = os.path.join(tempfile.gettempdir(),"report.html")
+        generate_html_report(results, fmt_checks, out)
+
+if __name__ == "__main__":
+    cli()
