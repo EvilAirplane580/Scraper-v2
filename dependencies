@@ -1,0 +1,3 @@
+pip install \
+  click requests bs4 psycopg2-binary prometheus_client \
+  pylint flake8 bandit mypy black autopep8 PySimpleGUI tqdm
