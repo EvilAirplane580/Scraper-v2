@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""
+SoloBounty – All-in-One Bug Bounty Toolkit (single-user edition)
+
+Features:
+ - Async crawling (aiohttp + aiodns)
+ - Scope enforcement (allowlist)
+ - Compliance (robots.txt + ToS)
+ - Secret scanning (API keys, JWTs, AWS keys)
+ - Vuln tests (XSS, SQLi, SSRF, CMDi)
+ - Persistence (SQLite with migration)
+ - Metrics (Prometheus)
+ - Integration: OWASP ZAP & Nuclei
+"""
+
+import os
+import sys
+import time
+import sqlite3
+import logging
+import signal
+import random
+import subprocess
+import asyncio
+import aiodns
+import aiohttp
+
+from datetime import datetime
+from contextlib import contextmanager
+from urllib.parse import urlparse, urljoin
+import urllib.robotparser
+import re
+
+import click
+from bs4 import BeautifulSoup
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+
+# Optional imports for scanners
+try:
+    from zapv2 import ZAPv2
+except ImportError:
+    ZAPv2 = None
+
+# -----------------------------------------------------------------------------
+#                          SQLITE SCHEMA & MIGRATION
+# -----------------------------------------------------------------------------
+DB = sqlite3.connect('solobounty.db', check_same_thread=False)
+DB.execute("PRAGMA journal_mode=WAL")
+
+def migrate_schema():
+    cur = DB.cursor()
+    # Get existing columns
+    cur.execute("PRAGMA table_info(findings)")
+    cols = [row[1] for row in cur.fetchall()]
+    # If missing, add detected_by column
+    if 'detected_by' not in cols:
+        try:
+            cur.execute("""
+                ALTER TABLE findings
+                ADD COLUMN detected_by TEXT DEFAULT 'unknown'
+            """)
+            DB.commit()
+        except sqlite3.OperationalError as e:
+            # Ignore "duplicate column name" error
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+# Base tables (idempotent)
+DB.execute("""
+CREATE TABLE IF NOT EXISTS urls (
+  url TEXT PRIMARY KEY,
+  crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+""")
+DB.execute("""
+CREATE TABLE IF NOT EXISTS findings (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  url        TEXT,
+  type       TEXT,
+  detail     TEXT,
+  detected_by TEXT,                         -- added by migration
+  found_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+""")
+DB.commit()
+migrate_schema()                              #  [oai_citation:4‡Stack Overflow](https://stackoverflow.com/questions/3604310/alter-table-add-column-if-not-exists-in-sqlite?utm_source=chatgpt.com)
+
+# -----------------------------------------------------------------------------
+#                               CONFIGURATION
+# -----------------------------------------------------------------------------
+ALLOW_DOMAINS = {"example.com", "api.example.com"}  # Scope enforcement
+OAST_DOMAIN   = "mycb.oast.pro"                     # for SSRF OOB
+
+TOS_PATTERNS  = [re.compile(p, re.I) for p in (
+    r'\bno\s+robots?\b', r'\bno\s+scraping\b',
+    r'\bno\s+automated\s+access\b', r'\bno\s+crawlers?\b'
+)]
+
+SECRET_PATTERNS = {
+    'api_key': re.compile(r"(?:(?:api|secret)[_-]?key|token)[=:]\s*['\"]([A-Za-z0-9]{20,})['\"]", re.I),
+    'jwt':     re.compile(r"(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]*)"),
+    'aws_key': re.compile(r"((AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16})"),
+}
+
+VULN_PAYLOADS = {
+    'xss':  ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>"],
+    'sqli': ["' OR 1=1--", "' UNION SELECT null,version()--"],
+    'ssrf': [f"http://{OAST_DOMAIN}/", "file:///etc/passwd"],
+    'cmdi': ["; whoami", "`id`"]
+}
+
+# -----------------------------------------------------------------------------
+#                              METRICS (Prometheus)
+# -----------------------------------------------------------------------------
+REQUESTS   = Counter('requests_total',   'HTTP requests made',['domain','status'])
+DURATION   = Histogram('request_duration_seconds','Req duration',['domain'])
+SECRETS    = Counter('secrets_found_total','Secrets found',['type'])
+QUEUE_SIZE = Gauge('queue_size',         'Async queue size')
+SSRF_HITS  = Counter('ssrf_callbacks',   'SSRF OOB Hits',['probe'])
+
+# -----------------------------------------------------------------------------
+#                         COMPLIANCE HELPERS
+# -----------------------------------------------------------------------------
+robots_parsers = {}
+tos_cache      = {}
+
+async def load_robots(session, domain):
+    rp = urllib.robotparser.RobotFileParser()
+    try:
+        async with session.get(f"https://{domain}/robots.txt", timeout=5) as r:
+            if r.status == 200:
+                txt = await r.text()
+                rp.parse(txt.splitlines())
+            else:
+                rp = None
+    except:
+        rp = None
+    robots_parsers[domain] = rp
+
+async def load_tos(session, domain):
+    for path in ("terms","terms-of-service","tos","legal"):
+        try:
+            async with session.get(f"https://{domain}/{path}", timeout=5) as r:
+                if r.status == 200:
+                    txt = await r.text()
+                    tos_cache[domain] = not any(p.search(txt) for p in TOS_PATTERNS)
+                    return
+        except:
+            continue
+    tos_cache[domain] = False
+
+async def allowed_to_crawl(session, url):
+    dom = urlparse(url).netloc.lower()
+    if dom not in ALLOW_DOMAINS: return False
+    if dom not in tos_cache:     await load_tos(session, dom)
+    if not tos_cache.get(dom):   return False
+    if dom not in robots_parsers: await load_robots(session, dom)
+    rp = robots_parsers.get(dom)
+    if rp and not rp.can_fetch('*', url): return False
+    return True
+
+# -----------------------------------------------------------------------------
+#                            VULNERABILITY TESTS
+# -----------------------------------------------------------------------------
+async def test_reflection(session, url):
+    params = {f"xss{i}": p for i,p in enumerate(VULN_PAYLOADS['xss'])}
+    async with session.get(url, params=params, timeout=8) as r:
+        body = await r.text()
+    return any(p in body for p in params.values())
+
+async def test_sqli(session, url):
+    for p in VULN_PAYLOADS['sqli']:
+        t0 = time.time()
+        async with session.get(f"{url}{p}", timeout=8) as r:
+            text = await r.text()
+        if any(err in text.lower() for err in ('sql syntax','mysql','sqlite','postgresql')):
+            return p, 'sqli_error'
+        if time.time() - t0 > 4:
+            return p, 'sqli_time'
+    return None, None
+
+async def test_ssrf(session, url):
+    probe = VULN_PAYLOADS['ssrf'][0]
+    parsed = urlparse(url)
+    target = parsed._replace(netloc=f"{probe.split('//')[1]}.{parsed.netloc}").geturl()
+    try:
+        await session.get(target, timeout=5)
+        SSRF_HITS.labels(probe=probe).inc()
+        return probe
+    except:
+        return None
+
+async def test_cmdi(session, url):
+    for p in VULN_PAYLOADS['cmdi']:
+        async with session.get(f"{url}{p}", timeout=8) as r:
+            text = await r.text()
+        if any(k in text.lower() for k in ('root:', 'uid=')):
+            return p
+    return None
+
+# -----------------------------------------------------------------------------
+#                                CRAWLER CORE
+# -----------------------------------------------------------------------------
+sem = asyncio.Semaphore(10)
+
+async def crawl_url(session, url):
+    async with sem:
+        if DB.execute("SELECT 1 FROM urls WHERE url=?", (url,)).fetchone():
+            return
+        if not await allowed_to_crawl(session, url):
+            return
+
+        start = time.time()
+        try:
+            async with session.get(url, timeout=10) as r:
+                elapsed = time.time() - start
+                REQUESTS.labels(domain=urlparse(url).netloc, status=r.status).inc()
+                DURATION.labels(domain=urlparse(url).netloc).observe(elapsed)
+                DB.execute("INSERT INTO urls(url) VALUES(?)", (url,))
+                DB.commit()
+                body = await r.text()
+                ctype = r.headers.get('Content-Type','')
+        except:
+            return
+
+        # Secret scanning
+        for name, pat in SECRET_PATTERNS.items():
+            for m in pat.findall(body):
+                SECRETS.labels(type=name).inc()
+                DB.execute(
+                  "INSERT INTO findings(url,type,detail,detected_by) VALUES (?,?,?,?)",
+                  (url, name, m, 'secret_scan')
+                )
+                DB.commit()
+
+        # Vulnerability tests
+        if await test_reflection(session, url):
+            DB.execute(
+              "INSERT INTO findings(url,type,detail,detected_by) VALUES (?,?,?,?)",
+              (url, 'xss', 'reflected', 'xss_reflection')
+            )
+        sqli_payload, sqli_detector = await test_sqli(session, url)
+        if sqli_payload:
+            DB.execute(
+              "INSERT INTO findings(url,type,detail,detected_by) VALUES (?,?,?,?)",
+              (url, 'sqli', sqli_payload, sqli_detector)
+            )
+        ssrf_probe = await test_ssrf(session, url)
+        if ssrf_probe:
+            DB.execute(
+              "INSERT INTO findings(url,type,detail,detected_by) VALUES (?,?,?,?)",
+              (url, 'ssrf', ssrf_probe, 'ssrf_oob')
+            )
+        cmdi_payload = await test_cmdi(session, url)
+        if cmdi_payload:
+            DB.execute(
+              "INSERT INTO findings(url,type,detail,detected_by) VALUES (?,?,?,?)",
+              (url, 'cmdi', cmdi_payload, 'cmd_injection')
+            )
+        DB.commit()
+
+        # Enqueue links
+        if 'text/html' in ctype:
+            for a in BeautifulSoup(body,'html.parser').find_all('a',href=True):
+                href = urljoin(url, a['href'])
+                if urlparse(href).netloc == urlparse(url).netloc:
+                    asyncio.create_task(crawl_url(session, href))
+
+# -----------------------------------------------------------------------------
+#                            EXTERNAL SCANNER HOOKS
+# -----------------------------------------------------------------------------
+def run_zap(target):
+    if not ZAPv2:
+        print("[!] ZAP API not installed.")
+        return
+    zap = ZAPv2(apikey='', proxies={'http':'http://127.0.0.1:8080','https':'http://127.0.0.1:8080'})
+    zap.urlopen(target)
+    sid = zap.spider.scan(target)
+    while int(zap.spider.status(sid)) < 100:
+        time.sleep(1)
+    alerts = zap.core.alerts()
+    for a in alerts:
+        DB.execute(
+          "INSERT INTO findings(url,type,detail,detected_by) VALUES (?,?,?,?)",
+          (target, a.get('alert','zap_alert'), a.get('uri',''), 'zap')
+        )
+    DB.commit()
+
+def run_nuclei(target):
+    try:
+        output = subprocess.check_output(
+            ["nuclei","-u",target,"-t","cves/","-t","exposures/"],
+            text=True
+        )
+    except subprocess.CalledProcessError as e:
+        output = e.output
+    for line in output.splitlines():
+        DB.execute(
+          "INSERT INTO findings(url,type,detail,detected_by) VALUES (?,?,?,?)",
+          (target, 'nuclei', line, 'nuclei')
+        )
+    DB.commit()
+
+# -----------------------------------------------------------------------------
+#                                     CLI
+# -----------------------------------------------------------------------------
+@click.command()
+@click.argument('start_url')
+@click.option('--zap',    is_flag=True, help="Run OWASP ZAP scan")
+@click.option('--nuclei', is_flag=True, help="Run Nuclei scan")
+def main(start_url, zap, nuclei):
+    """SoloBounty: full async crawl + vuln checks + scanners"""
+    start_http_server(9000)
+    loop = asyncio.get_event_loop()
+    async def runner():
+        async with aiohttp.ClientSession() as session:
+            await crawl_url(session, start_url)
+            await asyncio.sleep(5)
+    loop.run_until_complete(runner())
+
+    if zap:    run_zap(start_url)
+    if nuclei: run_nuclei(start_url)
+
+    print("[*] Crawl complete. Findings in solobounty.db")
+
+if __name__ == '__main__':
+    main()
