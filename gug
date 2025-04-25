@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""
+SoloBounty Crawler Script
+This script crawls bug bounty targets, respecting or ignoring robots.txt and ToS based on configuration.
+"""
+
+from __future__ import annotations
+import argparse
+import logging
+import urllib.robotparser
+from urllib.parse import urlparse
+from typing import List
+
+# Global logger setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="SoloBounty crawler with optional strict compliance to robots.txt and ToS.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--strict-compliance",
+        dest="strict_compliance",
+        action="store_true",
+        default=True,
+        help="Enforce strict compliance: respect robots.txt and Terms of Service (default: True)",
+    )
+    parser.add_argument(
+        "--no-strict-compliance",
+        dest="strict_compliance",
+        action="store_false",
+        help="Disable strict compliance: ignore robots.txt and Terms of Service restrictions",
+    )
+    # Additional arguments (example: target URL, allowed domains, etc.)
+    parser.add_argument(
+        "--url",
+        dest="start_url",
+        type=str,
+        required=True,
+        help="Initial URL to start crawling from",
+    )
+    parser.add_argument(
+        "--domains",
+        dest="allowed_domains",
+        type=str,
+        nargs="+",
+        required=True,
+        help="List of allowed domain scopes for crawling",
+    )
+    return parser.parse_args()
+
+
+def allowed_to_crawl(url: str, allowed_domains: List[str], strict_compliance: bool) -> bool:
+    """
+    Determine whether the crawler is allowed to access the given URL.
+    Checks against allowed domain scope, and optionally respects robots.txt and ToS.
+    """
+    parsed = urlparse(url)
+    domain = parsed.hostname or ""
+    path = parsed.path or "/"
+
+    # Always enforce domain scope (scope allowlist).
+    if domain not in allowed_domains:
+        logger.debug("Domain %s is not in allowed domains: %s", domain, allowed_domains)
+        return False
+
+    # If strict compliance is disabled, ignore robots.txt and ToS.
+    if not strict_compliance:
+        logger.debug(
+            "Strict compliance disabled: skipping robots.txt and ToS checks for %s", url
+        )
+        return True
+
+    # Strict compliance is enabled: check for robots.txt rules.
+    try:
+        rp = urllib.robotparser.RobotFileParser()
+        rp.set_url(f"{parsed.scheme}://{domain}/robots.txt")
+        rp.read()
+        if not rp.can_fetch("*", url):
+            logger.info("Blocked by robots.txt: %s", url)
+            return False
+    except Exception as e:
+        logger.warning("Failed to parse robots.txt for %s: %s", domain, e)
+        # If robots.txt cannot be fetched or parsed, proceed with caution.
+        # Here, we choose to allow if robotparser fails (can be changed to disallow if needed).
+        pass
+
+    # Check for common Terms of Service or legal page patterns in URL path.
+    tos_keywords = ["terms", "tos", "terms-of-service", "privacy", "legal"]
+    if any(keyword in path.lower() for keyword in tos_keywords):
+        logger.info("Skipping Terms-of-Service or legal page: %s", url)
+        return False
+
+    # If all checks pass, allow crawling.
+    return True
+
+
+def crawl(start_url: str, allowed_domains: List[str], strict_compliance: bool) -> None:
+    """
+    Crawl starting from start_url, respecting the allowed_domains scope.
+    Demonstrative stub: actual crawling implementation would be more elaborate.
+    """
+    to_visit: List[str] = [start_url]
+    visited: set[str] = set()
+
+    while to_visit:
+        url = to_visit.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        logger.info("Considering URL: %s", url)
+
+        if not allowed_to_crawl(url, allowed_domains, strict_compliance):
+            logger.info("Disallowed by policy: %s", url)
+            continue
+
+        # Placeholder for actual fetch and parse logic.
+        logger.info("Crawling URL: %s", url)
+        # Simulate discovering new links (omitted).
+        # new_links = fetch_links(url)
+        # for link in new_links:
+        #     if link not in visited:
+        #         to_visit.append(link)
+
+    logger.info("Crawling complete. Visited %d URLs.", len(visited))
+
+
+def main() -> None:
+    args = parse_arguments()
+    logger.info("Starting crawler with strict_compliance=%s", args.strict_compliance)
+    crawl(args.start_url, args.allowed_domains, args.strict_compliance)
+
+
+if __name__ == "__main__":
+    main()
