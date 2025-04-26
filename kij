@@ -1,0 +1,456 @@
+import argparse
+import asyncio
+import aiohttp
+from aiohttp import ClientSession
+import logging
+import sqlite3
+import re
+import subprocess
+import urllib.parse
+import json
+from typing import List, Set, Dict, Any
+from prometheus_client import start_http_server, Counter
+
+try:
+    from zapv2 import ZAPv2
+except ImportError:
+    ZAPv2 = None
+
+
+class Config:
+    """Configuration for the scanner based on CLI arguments."""
+    def __init__(self):
+        parser = argparse.ArgumentParser(description="SoloBounty Merged Vulnerability Scanner")
+        parser.add_argument(
+            "start_urls", nargs="+",
+            help="One or more starting URLs to crawl (e.g., https://example.com)"
+        )
+        parser.add_argument(
+            "--ignore-robots", action="store_true",
+            help="Ignore robots.txt and ToS policies (default: strict compliance)"
+        )
+        parser.add_argument(
+            "--max-concurrency", type=int, default=10,
+            help="Maximum concurrent requests (default: 10)"
+        )
+        parser.add_argument(
+            "--max-retries", type=int, default=3,
+            help="Maximum number of retries for failed requests (default: 3)"
+        )
+        parser.add_argument(
+            "--delay", type=float, default=0.1,
+            help="Delay in seconds between retry attempts (default: 0.1s)"
+        )
+        parser.add_argument(
+            "--sqlite-db", default="scan_results.db",
+            help="SQLite database file to store results (default: scan_results.db)"
+        )
+        parser.add_argument(
+            "--prometheus-port", type=int, default=8000,
+            help="Port for Prometheus metrics server (default: 8000)"
+        )
+        parser.add_argument(
+            "--enable-zap", action="store_true",
+            help="Enable OWASP ZAP scanning (requires ZAP API)"
+        )
+        parser.add_argument(
+            "--enable-nuclei", action="store_true",
+            help="Enable Nuclei scanning (requires nuclei CLI)"
+        )
+        parser.add_argument(
+            "--verbose", action="store_true",
+            help="Enable verbose (DEBUG) logging"
+        )
+        self.args = parser.parse_args()
+
+        # Configure logging level and format
+        log_format = "%(asctime)s [%(levelname)s] %(message)s"
+        if self.args.verbose:
+            logging.basicConfig(level=logging.DEBUG, format=log_format)
+        else:
+            logging.basicConfig(level=logging.INFO, format=log_format)
+
+
+class SoloBountyScanner:
+    """Main scanner class that handles crawling and vulnerability testing."""
+    def __init__(self, config: Config):
+        self.start_urls = config.args.start_urls
+        self.ignore_robots = config.args.ignore_robots
+        self.max_concurrency = config.args.max_concurrency
+        self.max_retries = config.args.max_retries
+        self.delay = config.args.delay
+        self.sqlite_db = config.args.sqlite_db
+        self.prometheus_port = config.args.prometheus_port
+        self.enable_zap = config.args.enable_zap
+        self.enable_nuclei = config.args.enable_nuclei
+
+        self.visited: Set[str] = set()
+        self.found_issues: List[Dict[str, Any]] = []
+        self.session: ClientSession = None
+        self.sem = asyncio.Semaphore(self.max_concurrency)
+
+        # Prometheus metrics counters
+        self.pages_scanned = Counter('pages_scanned', 'Total number of pages scanned')
+        self.vuln_found = Counter('vulnerabilities_found', 'Total vulnerabilities found')
+
+        # Start Prometheus metrics server
+        self.start_http_metrics()
+
+        # Initialize SQLite database for findings
+        self.conn = sqlite3.connect(self.sqlite_db)
+        self._init_db()
+
+    def start_http_metrics(self):
+        """Starts Prometheus HTTP server to expose metrics."""
+        start_http_server(self.prometheus_port)
+        logging.info(f"Prometheus metrics available on port {self.prometheus_port}")
+
+    def _init_db(self):
+        """Initialize SQLite database with the findings table."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS findings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT,
+                issue_type TEXT,
+                param TEXT,
+                detail TEXT,
+                detected_by TEXT
+            )
+        ''')
+        self.conn.commit()
+
+    async def run(self):
+        """Entry point to start the asynchronous crawling and scanning process."""
+        self.session = aiohttp.ClientSession()
+
+        # Kick off crawling from each start URL
+        tasks = [self._fetch_and_process(url) for url in self.start_urls]
+        await asyncio.gather(*tasks)
+
+        await self.session.close()
+
+        # After crawling, run optional external scans
+        if self.enable_zap:
+            self.run_zap_scan()
+        if self.enable_nuclei:
+            self.run_nuclei_scan()
+
+        # Save all findings to the database
+        self.save_findings()
+        self.conn.close()
+        logging.info("Scanning completed successfully.")
+
+    async def _fetch_and_process(self, url: str):
+        """Fetch a URL (with retries) and process its content."""
+        # Check robots.txt compliance
+        if not await self._allowed_by_robots(url):
+            return
+
+        # Skip if already visited
+        if url in self.visited:
+            return
+        self.visited.add(url)
+
+        # Acquire semaphore to limit concurrency
+        await self.sem.acquire()
+        content = None
+        try:
+            content = await self._fetch_url(url)
+        except Exception as e:
+            logging.error(f"Failed to fetch {url}: {e}")
+        finally:
+            self.sem.release()
+
+        if content is None:
+            return
+
+        # Mark page as scanned
+        self.pages_scanned.inc()
+
+        # Run vulnerability tests on the content
+        await self._scan_for_vulnerabilities(url, content)
+
+        # Extract and crawl internal links
+        links = self._extract_links(url, content)
+        tasks = [self._fetch_and_process(link) for link in links]
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _fetch_url(self, url: str, attempt: int = 1) -> str:
+        """Fetches a URL and returns its text content, with retry logic."""
+        try:
+            async with self.session.get(url, timeout=10) as response:
+                if response.status != 200:
+                    logging.warning(f"Non-200 status {response.status} for {url}")
+                    if attempt <= self.max_retries:
+                        await asyncio.sleep(self.delay)
+                        return await self._fetch_url(url, attempt + 1)
+                    return None
+                return await response.text()
+        except Exception as e:
+            logging.error(f"Error fetching {url}: {e}")
+            if attempt <= self.max_retries:
+                await asyncio.sleep(self.delay)
+                return await self._fetch_url(url, attempt + 1)
+            return None
+
+    async def _allowed_by_robots(self, url: str) -> bool:
+        """Checks robots.txt rules for the given URL (if compliance is enforced)."""
+        if self.ignore_robots:
+            return True
+
+        parsed = urllib.parse.urlparse(url)
+        domain = f"{parsed.scheme}://{parsed.netloc}"
+        robots_url = f"{domain}/robots.txt"
+
+        # Initialize robots_cache if needed
+        if not hasattr(self, 'robots_cache'):
+            self.robots_cache: Dict[str, Set[str]] = {}
+
+        if domain not in self.robots_cache:
+            # Fetch and parse robots.txt
+            try:
+                async with self.session.get(robots_url, timeout=5) as resp:
+                    if resp.status == 200:
+                        text = await resp.text()
+                        self.robots_cache[domain] = self._parse_robots(text)
+                    else:
+                        self.robots_cache[domain] = set()
+            except Exception:
+                self.robots_cache[domain] = set()
+
+        path = parsed.path or "/"
+        for disallowed_path in self.robots_cache.get(domain, []):
+            if path.startswith(disallowed_path):
+                logging.debug(f"Skipping {url} due to robots.txt disallow {disallowed_path}")
+                return False
+        return True
+
+    def _parse_robots(self, text: str) -> Set[str]:
+        """Parse robots.txt content to extract disallowed paths."""
+        disallowed = set()
+        ua_directive = False
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.lower().startswith('user-agent'):
+                ua = line.split(':', 1)[1].strip()
+                ua_directive = (ua == '*' or ua.lower() == 'solo')
+            elif ua_directive and line.lower().startswith('disallow'):
+                path = line.split(':', 1)[1].strip()
+                if path:
+                    disallowed.add(path)
+        return disallowed
+
+    def _in_scope(self, url: str) -> bool:
+        """Check if the URL is within the allowed domains (start URLs)."""
+        try:
+            allowed = [urllib.parse.urlparse(u).netloc for u in self.start_urls]
+            url_domain = urllib.parse.urlparse(url).netloc
+            return url_domain in allowed
+        except Exception:
+            return False
+
+    def _extract_links(self, base_url: str, html_content: str) -> List[str]:
+        """Extract internal links from HTML content (simple regex parsing)."""
+        links: List[str] = []
+        for match in re.findall(r'href=[\'"](.*?)[\'"]', html_content, re.IGNORECASE):
+            href = match.split('#')[0]  # remove fragment
+            if not href:
+                continue
+            link = urllib.parse.urljoin(base_url, href)
+            if self._in_scope(link):
+                links.append(link)
+        return list(set(links))
+
+    async def _scan_for_vulnerabilities(self, url: str, content: str):
+        """Run all vulnerability tests on the given URL/content."""
+        tasks = [
+            asyncio.create_task(self._test_xss(url, content)),
+            asyncio.create_task(self._test_sqli(url, content)),
+            asyncio.create_task(self._test_ssrf(url, content)),
+            asyncio.create_task(self._test_cmdi(url, content)),
+            asyncio.create_task(self._scan_for_secrets(url, content))
+        ]
+        await asyncio.gather(*tasks)
+
+    async def _test_xss(self, url: str, content: str):
+        """Test for reflected XSS by injecting a script payload into parameters."""
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.query:
+            return
+        params = urllib.parse.parse_qs(parsed.query)
+        for param in params:
+            payload = "<script>alert('XSS')</script>"
+            new_params = params.copy()
+            new_params[param] = payload
+            new_query = urllib.parse.urlencode(new_params, doseq=True)
+            test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+            try:
+                async with self.session.get(test_url, timeout=10) as resp:
+                    text = await resp.text()
+                    if payload in text:
+                        detail = f"Reflected XSS on parameter {param}"
+                        self._register_issue(url, "XSS", param, detail, detected_by="XSS Scanner")
+                        logging.info(f"XSS vulnerability found at {url} (param: {param})")
+                        self.vuln_found.inc()
+            except Exception as e:
+                logging.error(f"XSS test failed for {test_url}: {e}")
+
+    async def _test_sqli(self, url: str, content: str):
+        """Test for SQL injection by injecting SQL payload into parameters."""
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.query:
+            return
+        params = urllib.parse.parse_qs(parsed.query)
+        for param in params:
+            payload = "' OR '1'='1"
+            new_params = params.copy()
+            new_params[param] = payload
+            new_query = urllib.parse.urlencode(new_params, doseq=True)
+            test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+            try:
+                async with self.session.get(test_url, timeout=10) as resp:
+                    text = await resp.text()
+                    # Heuristic checks: presence of 'sql' errors or the payload itself
+                    if payload in text or "sql" in text.lower():
+                        detail = f"Possible SQL injection on parameter {param}"
+                        self._register_issue(url, "SQLi", param, detail, detected_by="SQLi Scanner")
+                        logging.info(f"SQLi vulnerability found at {url} (param: {param})")
+                        self.vuln_found.inc()
+            except Exception as e:
+                logging.error(f"SQLi test failed for {test_url}: {e}")
+
+    async def _test_ssrf(self, url: str, content: str):
+        """Test for SSRF by injecting a callback URL into any 'url' parameter."""
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.query:
+            return
+        params = urllib.parse.parse_qs(parsed.query)
+        for param in params:
+            if 'url' in param.lower():
+                # Use example.com as a benign external callback host
+                callback = "http://example.com"
+                new_params = params.copy()
+                new_params[param] = callback
+                new_query = urllib.parse.urlencode(new_params, doseq=True)
+                test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+                try:
+                    async with self.session.get(test_url, timeout=10):
+                        # We simply log that the SSRF payload was sent; 
+                        # actual callback handling requires an external listener.
+                        detail = f"SSRF payload sent via parameter {param}"
+                        self._register_issue(url, "SSRF", param, detail, detected_by="SSRF Scanner")
+                        logging.info(f"SSRF test sent for {url} (param: {param})")
+                        self.vuln_found.inc()
+                except Exception as e:
+                    logging.error(f"SSRF test failed for {test_url}: {e}")
+
+    async def _test_cmdi(self, url: str, content: str):
+        """Test for command injection by injecting a harmless command into parameters."""
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.query:
+            return
+        params = urllib.parse.parse_qs(parsed.query)
+        for param in params:
+            payload = "test; id"
+            new_params = params.copy()
+            new_params[param] = payload
+            new_query = urllib.parse.urlencode(new_params, doseq=True)
+            test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+            try:
+                async with self.session.get(test_url, timeout=10) as resp:
+                    text = await resp.text()
+                    if "uid=" in text or "gid=" in text or "id=" in text:
+                        detail = f"Possible command injection on parameter {param}"
+                        self._register_issue(url, "CMDi", param, detail, detected_by="CMDi Scanner")
+                        logging.info(f"CMDi vulnerability found at {url} (param: {param})")
+                        self.vuln_found.inc()
+            except Exception as e:
+                logging.error(f"CMDi test failed for {test_url}: {e}")
+
+    async def _scan_for_secrets(self, url: str, content: str):
+        """Scan page content for common secret patterns (API keys, tokens, etc.)."""
+        patterns = {
+            'AWS Access Key': r'AKIA[0-9A-Z]{16}',
+            'AWS Secret Key': r'(?i)aws(.{0,20})?SECRET(.{0,20})?[0-9A-Za-z/+=]{40}',
+            'Slack Token': r'xox[baprs]-[0-9a-zA-Z]{10,48}',
+            'GitHub Token': r'[0-9a-fA-F]{40}',
+        }
+        for desc, regex in patterns.items():
+            for match in re.findall(regex, content):
+                detail = f"Found possible {desc}: {match}"
+                self._register_issue(url, "Secret", None, detail, detected_by="Secret Scanner")
+                logging.info(f"Secret found at {url}: {desc}")
+                self.vuln_found.inc()
+
+    def _register_issue(self, url: str, issue_type: str, param: Any, detail: str, detected_by: str):
+        """Registers a discovered issue for later storage."""
+        self.found_issues.append({
+            'url': url,
+            'issue_type': issue_type,
+            'param': param,
+            'detail': detail,
+            'detected_by': detected_by
+        })
+
+    def save_findings(self):
+        """Save all collected findings into the SQLite database."""
+        cursor = self.conn.cursor()
+        for issue in self.found_issues:
+            cursor.execute(
+                'INSERT INTO findings (url, issue_type, param, detail, detected_by) VALUES (?, ?, ?, ?, ?)',
+                (issue['url'], issue['issue_type'], issue['param'], issue['detail'], issue['detected_by'])
+            )
+        self.conn.commit()
+
+    def run_zap_scan(self):
+        """Trigger an OWASP ZAP scan on all discovered URLs (requires ZAP API)."""
+        if ZAPv2 is None:
+            logging.warning("ZAP integration unavailable: python-owasp-zap-v2.0 is not installed.")
+            return
+        logging.info("Starting OWASP ZAP scan on visited URLs...")
+        try:
+            zap = ZAPv2()  # Default config assumes ZAP is on localhost:8080
+            for url in self.visited:
+                zap.urlopen(url)
+                zap.spider.scan(url)
+                zap.ascan.scan(url)
+                logging.debug(f"Triggered ZAP spider/ascan for {url}")
+            logging.info("OWASP ZAP scanning initiated.")
+        except Exception as e:
+            logging.error(f"Error during ZAP scanning: {e}")
+
+    def run_nuclei_scan(self):
+        """Run Nuclei scanner on the start URLs and record any findings."""
+        logging.info("Running Nuclei scan on start URLs...")
+        for url in self.start_urls:
+            try:
+                result = subprocess.run(
+                    ["nuclei", "-u", url, "-json"], capture_output=True, text=True
+                )
+                for line in result.stdout.splitlines():
+                    try:
+                        data = json.loads(line)
+                        info = data.get("info", {})
+                        detail = info.get("name", "")
+                        issue_id = data.get("id", "")
+                        self._register_issue(
+                            url, "Nuclei", None,
+                            f"{detail} (template ID: {issue_id})",
+                            detected_by="Nuclei Scanner"
+                        )
+                        logging.info(f"Nuclei found issue: {detail} on {url}")
+                        self.vuln_found.inc()
+                    except json.JSONDecodeError:
+                        continue
+            except Exception as e:
+                logging.error(f"Nuclei scan failed for {url}: {e}")
+
+
+if __name__ == "__main__":
+    config = Config()
+    scanner = SoloBountyScanner(config)
+    asyncio.run(scanner.run())
